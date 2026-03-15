@@ -10,6 +10,7 @@ from ui.simulation_view import SimulationView
 from ui.control_panel import ControlPanel
 from ui.plot_panel import PlotPanel
 from ui.widgets.stats_display import StatsDisplay
+from analysis.logger import SimulationLogger
 
 
 class MainWindow(QMainWindow):
@@ -19,6 +20,7 @@ class MainWindow(QMainWindow):
         self.event_bus = event_bus
         self.runner    = SimulationRunner(params, event_bus)
         self._paused   = False
+        self._logger   = SimulationLogger()
 
         self.setWindowTitle("Predator-Prey Genetic Simulator")
         self.resize(1400, 820)
@@ -117,11 +119,13 @@ class MainWindow(QMainWindow):
     def _on_snapshot(self, snapshot: SimulationSnapshot):
         self.sim_view.render_snapshot(snapshot)   # stores snapshot; QTimer drives repaint
         self.stats_display.update_stats(snapshot)
+        self._logger.log_tick(snapshot)
         if snapshot.tick % 5 == 0:
             self.plot_panel.update_plot(snapshot)
 
     def _on_start(self):
         if not self.runner.isRunning():
+            self._logger.start_session()
             self.runner.start()
             self.btn_start.setEnabled(False)
             self.btn_pause.setEnabled(True)
@@ -142,10 +146,14 @@ class MainWindow(QMainWindow):
 
     def _on_reset(self):
         self.sim_view.clear()
+        self.plot_panel.clear_history()
+        self._logger.end_session()
+        self._logger.start_session()
         self.runner.reset()
 
     # ------------------------------------------------------------------
 
     def closeEvent(self, event):
+        self._logger.end_session()
         self.runner.stop_simulation()
         event.accept()
