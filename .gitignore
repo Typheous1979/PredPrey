@@ -19,6 +19,12 @@ build/
 .vscode/
 .idea/
 
+# Database
+predprey.db
+
+# Logs
+logs/
+
 # OS
 .DS_Store
 Thumbs.db

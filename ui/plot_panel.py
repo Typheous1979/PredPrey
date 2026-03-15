@@ -1,16 +1,19 @@
-import csv
-from pathlib import Path
-
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QFileDialog, QMessageBox
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QComboBox, QMessageBox,
+)
+from PyQt6.QtCore import Qt
 import pyqtgraph as pg
-from pyqtgraph.exporters import ImageExporter
 
 from core.snapshot import SimulationSnapshot
+from analysis.database import SimulationDB
 
 
 class PlotPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._db = SimulationDB()
+        self._history: list[tuple[int, int, int, int]] = []  # (tick, prey, pred, plants)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
@@ -18,6 +21,38 @@ class PlotPanel(QWidget):
         pg.setConfigOption("background", "#1e1e1e")
         pg.setConfigOption("foreground", "#cccccc")
 
+        # ── Save button ────────────────────────────────────────────────
+        self.btn_save = QPushButton("Save Run to Database")
+        self.btn_save.setFixedHeight(28)
+        self.btn_save.setToolTip("Save the current run's full history to the database")
+        self.btn_save.clicked.connect(self._save_run)
+
+        # ── Saved-runs dropdown ────────────────────────────────────────
+        self.run_combo = QComboBox()
+        self.run_combo.setToolTip("Select a saved run to load or manage")
+        self.run_combo.currentIndexChanged.connect(self._on_run_selected)
+
+        # ── Delete / Analyze buttons ───────────────────────────────────
+        action_bar = QWidget()
+        action_layout = QHBoxLayout(action_bar)
+        action_layout.setContentsMargins(0, 0, 0, 0)
+        action_layout.setSpacing(4)
+
+        self.btn_delete = QPushButton("Delete Record")
+        self.btn_delete.setFixedHeight(26)
+        self.btn_delete.setToolTip("Permanently delete the selected run from the database")
+        self.btn_delete.clicked.connect(self._delete_run)
+
+        self.btn_analyze = QPushButton("Analyze")
+        self.btn_analyze.setFixedHeight(26)
+        self.btn_analyze.setToolTip("Analyze the selected run (Phase 2)")
+        self.btn_analyze.clicked.connect(self._analyze_run)
+
+        action_layout.addWidget(self.btn_delete)
+        action_layout.addWidget(self.btn_analyze)
+        action_layout.addStretch()
+
+        # ── Plot ───────────────────────────────────────────────────────
         self.plot_widget = pg.PlotWidget(title="Population Over Time")
         self.plot_widget.setLabel("left",   "Count")
         self.plot_widget.setLabel("bottom", "Tick")
@@ -28,36 +63,20 @@ class PlotPanel(QWidget):
         self.pred_curve  = self.plot_widget.plot(pen=pg.mkPen("#dc322f", width=2), name="Predators")
         self.plant_curve = self.plot_widget.plot(pen=pg.mkPen("#228b22", width=2), name="Plants")
 
-        # Full history accumulated across the entire run (not capped at 200)
-        self._history: list[tuple[int, int, int, int]] = []  # (tick, prey, pred, plants)
-
-        # Export buttons
-        btn_bar = QWidget()
-        btn_layout = QHBoxLayout(btn_bar)
-        btn_layout.setContentsMargins(0, 0, 0, 0)
-        btn_layout.setSpacing(4)
-
-        self.btn_export_csv = QPushButton("Export CSV")
-        self.btn_export_csv.setFixedHeight(26)
-        self.btn_export_csv.setToolTip("Save full run history to a CSV file for analysis")
-        self.btn_export_csv.clicked.connect(self._export_csv)
-
-        self.btn_export_png = QPushButton("Export Plot")
-        self.btn_export_png.setFixedHeight(26)
-        self.btn_export_png.setToolTip("Save the current population graph as a PNG image")
-        self.btn_export_png.clicked.connect(self._export_png)
-
-        btn_layout.addWidget(self.btn_export_csv)
-        btn_layout.addWidget(self.btn_export_png)
-        btn_layout.addStretch()
-
+        layout.addWidget(self.btn_save)
+        layout.addWidget(self.run_combo)
+        layout.addWidget(action_bar)
         layout.addWidget(self.plot_widget)
-        layout.addWidget(btn_bar)
 
+        self._refresh_combo()
+        self._update_action_buttons()
+
+    # ------------------------------------------------------------------
+    # Simulation data
     # ------------------------------------------------------------------
 
     def clear_history(self):
-        """Call on simulation reset to start accumulating a fresh run."""
+        """Call on simulation reset."""
         self._history.clear()
         self.prey_curve.setData([], [])
         self.pred_curve.setData([], [])
@@ -68,59 +87,120 @@ class PlotPanel(QWidget):
         if not history:
             return
 
-        n        = len(history)
+        n         = len(history)
         base_tick = snapshot.tick - n + 1
-        ticks    = list(range(base_tick, snapshot.tick + 1))
+        ticks     = list(range(base_tick, snapshot.tick + 1))
 
-        # Merge incoming window into full history (avoid duplicates by tick)
-        known_ticks = {row[0] for row in self._history}
+        known = {r[0] for r in self._history}
         for t, h in zip(ticks, history):
-            if t not in known_ticks:
+            if t not in known:
                 self._history.append((t, h[0], h[1], h[2]))
 
-        # Sort by tick to keep order consistent
         self._history.sort(key=lambda r: r[0])
-
-        all_ticks  = [r[0] for r in self._history]
-        all_prey   = [r[1] for r in self._history]
-        all_preds  = [r[2] for r in self._history]
-        all_plants = [r[3] for r in self._history]
-
-        self.prey_curve.setData(all_ticks,  all_prey)
-        self.pred_curve.setData(all_ticks,  all_preds)
-        self.plant_curve.setData(all_ticks, all_plants)
+        self._draw_history(self._history)
 
     # ------------------------------------------------------------------
-    # Export
+    # Database actions
     # ------------------------------------------------------------------
 
-    def _export_csv(self):
+    def _save_run(self):
         if not self._history:
-            QMessageBox.information(self, "No Data", "No history to export yet. Start the simulation first.")
+            QMessageBox.information(
+                self, "No Data",
+                "No run data to save yet. Start the simulation first."
+            )
             return
 
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export History CSV", "population_history.csv",
-            "CSV Files (*.csv);;All Files (*)"
+        run_id = self._db.save_run(self._history)
+        self._refresh_combo()
+        # Select the newly saved run in the dropdown
+        for i in range(self.run_combo.count()):
+            if self.run_combo.itemData(i) == run_id:
+                self.run_combo.setCurrentIndex(i)
+                break
+        QMessageBox.information(
+            self, "Saved",
+            f"Run #{run_id} saved ({len(self._history)} ticks)."
         )
-        if not path:
+
+    def _delete_run(self):
+        run_id = self._selected_run_id()
+        if run_id is None:
             return
-
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["tick", "prey", "predators", "plants"])
-            writer.writerows(self._history)
-
-        QMessageBox.information(self, "Exported", f"Saved {len(self._history)} rows to:\n{path}")
-
-    def _export_png(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export Plot Image", "population_plot.png",
-            "PNG Images (*.png);;All Files (*)"
+        reply = QMessageBox.question(
+            self, "Delete Run",
+            f"Permanently delete Run #{run_id} from the database?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
-        if not path:
+        if reply != QMessageBox.StandardButton.Yes:
             return
+        self._db.delete_run(run_id)
+        self._refresh_combo()
+        # Restore the live run view after deletion
+        self._draw_history(self._history)
 
-        exporter = ImageExporter(self.plot_widget.plotItem)
-        exporter.export(path)
-        QMessageBox.information(self, "Exported", f"Plot saved to:\n{path}")
+    def _analyze_run(self):
+        run_id = self._selected_run_id()
+        if run_id is None:
+            return
+        # Phase 2 — full analysis UI coming next
+        QMessageBox.information(
+            self, "Analyze — Coming in Phase 2",
+            f"Analysis engine for Run #{run_id} will be built in the next phase.\n\n"
+            "Planned metrics:\n"
+            "  • Peak populations & timing\n"
+            "  • Extinction events\n"
+            "  • Population stability score\n"
+            "  • Lotka-Volterra oscillation period (FFT)\n"
+            "  • Strategy comparison across runs"
+        )
+
+    # ------------------------------------------------------------------
+    # Dropdown helpers
+    # ------------------------------------------------------------------
+
+    def _refresh_combo(self):
+        self.run_combo.blockSignals(True)
+        self.run_combo.clear()
+        runs = self._db.list_runs()
+        if runs:
+            for run_id, label in runs:
+                self.run_combo.addItem(label, userData=run_id)
+        else:
+            self.run_combo.addItem("No saved runs", userData=None)
+        self.run_combo.blockSignals(False)
+        self._update_action_buttons()
+
+    def _on_run_selected(self, index: int):
+        run_id = self.run_combo.itemData(index)
+        self._update_action_buttons()
+        if run_id is None:
+            return
+        rows = self._db.load_run(run_id)
+        self._draw_history(rows)
+
+    def _selected_run_id(self) -> int | None:
+        return self.run_combo.currentData()
+
+    def _update_action_buttons(self):
+        enabled = self._selected_run_id() is not None
+        self.btn_delete.setEnabled(enabled)
+        self.btn_analyze.setEnabled(enabled)
+
+    # ------------------------------------------------------------------
+    # Drawing
+    # ------------------------------------------------------------------
+
+    def _draw_history(self, rows: list[tuple[int, int, int, int]]):
+        if not rows:
+            self.prey_curve.setData([], [])
+            self.pred_curve.setData([], [])
+            self.plant_curve.setData([], [])
+            return
+        ticks  = [r[0] for r in rows]
+        prey   = [r[1] for r in rows]
+        preds  = [r[2] for r in rows]
+        plants = [r[3] for r in rows]
+        self.prey_curve.setData(ticks,  prey)
+        self.pred_curve.setData(ticks,  preds)
+        self.plant_curve.setData(ticks, plants)
