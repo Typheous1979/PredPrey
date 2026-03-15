@@ -6,6 +6,8 @@ import pyqtgraph as pg
 
 from core.snapshot import SimulationSnapshot
 from analysis.database import SimulationDB
+from analysis.analyzer import analyse_run
+from ui.analysis_dialog import AnalysisDialog
 
 
 class PlotPanel(QWidget):
@@ -143,17 +145,17 @@ class PlotPanel(QWidget):
         run_id = self._selected_run_id()
         if run_id is None:
             return
-        # Phase 2 — full analysis UI coming next
-        QMessageBox.information(
-            self, "Analyze — Coming in Phase 2",
-            f"Analysis engine for Run #{run_id} will be built in the next phase.\n\n"
-            "Planned metrics:\n"
-            "  • Peak populations & timing\n"
-            "  • Extinction events\n"
-            "  • Population stability score\n"
-            "  • Lotka-Volterra oscillation period (FFT)\n"
-            "  • Strategy comparison across runs"
-        )
+        rows = self._db.load_run(run_id)
+        if not rows:
+            QMessageBox.warning(self, "No Data", f"Run #{run_id} has no tick data.")
+            return
+        try:
+            result = analyse_run(run_id, rows)
+        except Exception as e:
+            QMessageBox.critical(self, "Analysis Error", str(e))
+            return
+        dlg = AnalysisDialog(result, parent=self)
+        dlg.exec()
 
     # ------------------------------------------------------------------
     # Dropdown helpers
